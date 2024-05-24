@@ -1329,6 +1329,27 @@ class UnifiedLog(@volatile var logStartOffset: Long,
         } else {
           Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
         }
+      } else if (targetTimestamp == ListOffsetsRequest.EARLIEST_PENDING_UPLOAD_OFFSET_TIMESTAMP) {
+        if (remoteLogEnabled()) {
+          val curHighestRemoteOffset = highestOffsetInRemoteStorage()
+
+          if (curHighestRemoteOffset == -1) {
+            if (localLogStartOffset() == logStartOffset) {
+              // No segments have been uploaded yet
+              fetchOffsetByTimestamp(ListOffsetsRequest.EARLIEST_TIMESTAMP, remoteLogManager)
+            } else {
+              // Leader currently does not know about the already uploaded segments
+              Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
+            }
+          } else {
+            val earliestPendingUploadOffset = math.max(curHighestRemoteOffset + 1, logStartOffset)
+            val epochResult = leaderEpochCache.flatMap(_.epochForOffset(earliestPendingUploadOffset).asScala)
+              .asJava.asInstanceOf[Optional[Integer]]
+            Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, earliestPendingUploadOffset, epochResult))
+          }
+        } else {
+          Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
+        }
       } else if (targetTimestamp == ListOffsetsRequest.MAX_TIMESTAMP) {
         // Cache to avoid race conditions. `toBuffer` is faster than most alternatives and provides
         // constant time access while being safe to use with concurrent collections unlike `toArray`.
