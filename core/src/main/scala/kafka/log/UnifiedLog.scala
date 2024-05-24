@@ -1333,6 +1333,35 @@ class UnifiedLog(@volatile var logStartOffset: Long,
         } else {
           Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
         }
+      } else if (targetTimestamp == ListOffsetsRequest.EARLIEST_PENDING_UPLOAD_OFFSET_TIMESTAMP) {
+        if (remoteLogEnabled()) {
+          val curHighestRemoteOffset = highestOffsetInRemoteStorage()
+
+          if (curHighestRemoteOffset == -1) {
+            Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
+          } else {
+            val earliestPendingUploadOffset = if (curHighestRemoteOffset + 1 < localLogStartOffset()) {
+              localLogStartOffset()
+            } else {
+              curHighestRemoteOffset + 1
+            }
+
+            val epochResult: Optional[Integer] =
+              if (leaderEpochCache.isDefined) {
+                val epochOpt = leaderEpochCache.get.epochForOffset(earliestPendingUploadOffset)
+                if (epochOpt.isPresent) {
+                  Optional.of(epochOpt.getAsInt)
+                } else {
+                  Optional.empty()
+                }
+              } else {
+                Optional.empty()
+              }
+            Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, earliestPendingUploadOffset, epochResult))
+          }
+        } else {
+          Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, -1L, Optional.of(-1)))
+        }
       } else if (targetTimestamp == ListOffsetsRequest.MAX_TIMESTAMP) {
         // Cache to avoid race conditions. `toBuffer` is faster than most alternatives and provides
         // constant time access while being safe to use with concurrent collections unlike `toArray`.
