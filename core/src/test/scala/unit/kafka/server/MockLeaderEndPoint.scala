@@ -137,6 +137,12 @@ class MockLeaderEndPoint(sourceBroker: BrokerEndPoint = new BrokerEndPoint(1, ho
     new OffsetAndEpoch(leaderState.localLogStartOffset, leaderState.leaderEpoch)
   }
 
+  override def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, leaderEpoch: Int): OffsetAndEpoch = {
+    val leaderState = leaderPartitionState(topicPartition)
+    checkLeaderEpochAndThrow(leaderEpoch, leaderState)
+    new OffsetAndEpoch(leaderState.earliestOffsetPendingUpload, leaderState.leaderEpoch)
+  }
+
   override def fetchEpochEndOffsets(partitions: Map[TopicPartition, EpochData]): Map[TopicPartition, EpochEndOffset] = {
     val endOffsets = mutable.Map[TopicPartition, EpochEndOffset]()
     partitions.forKeyValue { (partition, epochData) =>
@@ -264,13 +270,18 @@ class PartitionState(var log: mutable.Buffer[RecordBatch],
                      var logEndOffset: Long,
                      var highWatermark: Long,
                      var rlmEnabled: Boolean = false,
-                     var localLogStartOffset: Long)
+                     var localLogStartOffset: Long,
+                     var earliestOffsetPendingUpload: Long)
 
 object PartitionState {
-  def apply(log: Seq[RecordBatch], leaderEpoch: Int, highWatermark: Long, rlmEnabled: Boolean = false): PartitionState = {
+  def apply(log: Seq[RecordBatch], leaderEpoch: Int, highWatermark: Long, rlmEnabled: Boolean, earliestOffsetPendingUpload: Long): PartitionState = {
     val logStartOffset = log.headOption.map(_.baseOffset).getOrElse(0L)
     val logEndOffset = log.lastOption.map(_.nextOffset).getOrElse(0L)
-    new PartitionState(log.toBuffer, leaderEpoch, logStartOffset, logEndOffset, highWatermark, rlmEnabled, logStartOffset)
+    new PartitionState(log.toBuffer, leaderEpoch, logStartOffset, logEndOffset, highWatermark, rlmEnabled, logStartOffset, earliestOffsetPendingUpload)
+  }
+
+  def apply(log: Seq[RecordBatch], leaderEpoch: Int, highWatermark: Long, rlmEnabled: Boolean = false): PartitionState = {
+    apply(log, leaderEpoch, highWatermark, rlmEnabled, earliestOffsetPendingUpload = -1L)
   }
 
   def apply(leaderEpoch: Int): PartitionState = {

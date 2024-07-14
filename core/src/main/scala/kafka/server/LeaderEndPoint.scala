@@ -105,6 +105,8 @@ trait LeaderEndPoint {
    */
   def fetchEarliestLocalOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch
 
+  def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch
+
   /**
    * Builds a fetch request, given a partition map.
    *

@@ -21,7 +21,6 @@ import kafka.cluster.BrokerEndPoint
 import kafka.server.AbstractFetcherThread.{ReplicaFetch, ResultWithPartitions}
 import kafka.utils.Implicits.MapExtensionMethods
 import kafka.utils.TestUtils
-import org.apache.kafka.common.message.FetchResponseData.PartitionData
 import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData.EpochEndOffset
 import org.apache.kafka.common.requests.FetchRequest
 import org.apache.kafka.common.utils.Utils
@@ -310,10 +309,12 @@ class AbstractFetcherManagerTest {
     override val isTruncationOnFetchSupported: Boolean = false
 
     override def fetchEarliestLocalOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = new OffsetAndEpoch(1L, 0)
+
+    override def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = new OffsetAndEpoch(1L, 0)
   }
 
   private class MockResizeFetcherTierStateMachine extends TierStateMachine(null, null, false) {
-    override def start(topicPartition: TopicPartition, currentFetchState: PartitionFetchState, fetchPartitionData: PartitionData): PartitionFetchState = {
+    override def start(topicPartition: TopicPartition, topicId: Option[Uuid], currentLeaderEpoch: Int, leaderLocalStartOffset: Long, offsetAndEpochToStartLocalLog: OffsetAndEpoch): PartitionFetchState = {
       throw new UnsupportedOperationException("Materializing tier state is not supported in this test.")
     }
   }
@@ -345,6 +346,8 @@ class AbstractFetcherManagerTest {
     override protected def endOffsetForEpoch(topicPartition: TopicPartition, epoch: Int): Option[OffsetAndEpoch] = Some(new OffsetAndEpoch(1, 0))
 
     override protected val isOffsetForLeaderEpochSupported: Boolean = false
+
+    override protected def shouldUseTieredOffsetStrategy(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean = false
   }
 
 }

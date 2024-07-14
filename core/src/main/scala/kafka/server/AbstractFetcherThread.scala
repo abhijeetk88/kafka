@@ -96,6 +96,8 @@ abstract class AbstractFetcherThread(name: String,
 
   protected val isOffsetForLeaderEpochSupported: Boolean
 
+  protected def shouldUseTieredOffsetStrategy(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean
+
   override def shutdown(): Unit = {
     initiateShutdown()
     inLock(partitionMapLock) {
@@ -650,7 +652,13 @@ abstract class AbstractFetcherThread(name: String,
      */
     val offsetAndEpoch = leader.fetchLatestOffset(topicPartition, currentLeaderEpoch)
     val leaderEndOffset = offsetAndEpoch.offset
-    if (leaderEndOffset < replicaEndOffset) {
+    val useTieredOffsetStrategy = shouldUseTieredOffsetStrategy(topicPartition, leaderEndOffset, replicaEndOffset)
+
+    if (useTieredOffsetStrategy) {
+      val offsetAndEpoch = offsetToStartLocalLogForTieredOffsetStrategy(topicPartition, currentLeaderEpoch)
+      val leaderStartOffset = leader.fetchEarliestOffset(topicPartition, currentLeaderEpoch).offset()
+      fetchTierStateMachine.start(topicPartition, topicId, currentLeaderEpoch, leaderStartOffset, offsetAndEpoch)
+    } else if (leaderEndOffset < replicaEndOffset) {
       warn(s"Reset fetch offset for partition $topicPartition from $replicaEndOffset to current " +
         s"leader's latest offset $leaderEndOffset")
       truncate(topicPartition, OffsetTruncationState(leaderEndOffset, truncationCompleted = true))
@@ -740,6 +748,26 @@ abstract class AbstractFetcherThread(name: String,
     }
   }
 
+  private def offsetToStartLocalLog(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = {
+    val leaderEndOffset = leader.fetchLatestOffset(topicPartition, currentLeaderEpoch).offset()
+    val replicaEndOffset = logEndOffset(topicPartition)
+
+    if (shouldUseTieredOffsetStrategy(topicPartition, leaderEndOffset, replicaEndOffset)) {
+      offsetToStartLocalLogForTieredOffsetStrategy(topicPartition, currentLeaderEpoch)
+    } else {
+      leader.fetchEarliestLocalOffset(topicPartition, currentLeaderEpoch)
+    }
+  }
+
+  private def offsetToStartLocalLogForTieredOffsetStrategy(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = {
+    val earliestPendingOffsetAndEpoch = leader.fetchEarliestPendingUploadOffset(topicPartition, currentLeaderEpoch)
+    if (earliestPendingOffsetAndEpoch.offset() == -1) {
+      throw new OffsetNotAvailableException("Segments are uploaded to remote storage, but the leader does not have the information about the uploaded segments")
+    } else {
+      earliestPendingOffsetAndEpoch
+    }
+  }
+
   /**
    * Handles the offset moved to tiered storage error for the given topic partition.
    *
@@ -758,9 +786,11 @@ abstract class AbstractFetcherThread(name: String,
   private def handleOffsetsMovedToTieredStorage(topicPartition: TopicPartition,
                                                 fetchState: PartitionFetchState,
                                                 leaderEpochInRequest: Optional[Integer],
-                                                fetchPartitionData: PartitionData): Boolean = {
+                                                fetchPartitionData: PartitionData) = {
     try {
-      val newFetchState = fetchTierStateMachine.start(topicPartition, fetchState, fetchPartitionData)
+      val offsetAndEpoch = offsetToStartLocalLog(topicPartition, fetchState.currentLeaderEpoch)
+      val newFetchState = fetchTierStateMachine.start(topicPartition, fetchState.topicId, fetchState.currentLeaderEpoch,
+        fetchPartitionData.logStartOffset(), offsetAndEpoch)
 
       // TODO: use fetchTierStateMachine.maybeAdvanceState when implementing async tiering logic in KAFKA-13560
 

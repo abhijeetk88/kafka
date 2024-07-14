@@ -136,6 +136,14 @@ class LocalLeaderEndPoint(sourceBroker: BrokerEndPoint,
     new OffsetAndEpoch(localLogStartOffset, epoch.orElse(0))
   }
 
+  override def fetchEarliestPendingUploadOffset(topicPartition: TopicPartition, currentLeaderEpoch: Int): OffsetAndEpoch = {
+    val partition = replicaManager.getPartitionOrException(topicPartition)
+    // TODO fix this to use the correct offset
+    val earliestPendingUploadOffset = partition.localLogOrException._highestOffsetInRemoteStorage + 1
+    val epoch = partition.localLogOrException.leaderEpochCache.get.epochForOffset(earliestPendingUploadOffset)
+    new OffsetAndEpoch(earliestPendingUploadOffset, epoch.orElse(0))
+  }
+
   override def fetchEpochEndOffsets(partitions: collection.Map[TopicPartition, EpochData]): Map[TopicPartition, EpochEndOffset] = {
     partitions.map { case (tp, epochData) =>
       try {

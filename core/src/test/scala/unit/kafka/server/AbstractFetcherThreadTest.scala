@@ -31,6 +31,8 @@ import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.{BeforeEach, Test}
 import kafka.server.FetcherThreadTestUtils.{initialFetchState, mkBatch}
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ArrayBuffer
@@ -1140,4 +1142,896 @@ class AbstractFetcherThreadTest {
     assertTrue(fetcher.fetchState(unknownPartition).isEmpty)
   }
 
+  private def emptyReplicaState(rlmEnabled: Boolean, partition: TopicPartition, fetcher: MockFetcherThread) = {
+    // Follower begins from an empty offset which is behind the leader's log start offset
+    val replicaState = PartitionState(Seq(), leaderEpoch = 0, highWatermark = 0L, rlmEnabled = rlmEnabled)
+    fetcher.setReplicaState(partition, replicaState)
+    fetcher.addPartitions(Map(partition -> initialFetchState(topicIds.get(partition.topic), fetchOffset = 0, leaderEpoch = 0)))
+    replicaState
+  }
+
+  /**
+   * Case 1
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset = 0
+   *  - Leader LocalLogStartOffset = 0
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledZeroLeaderNoSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 0
+      mkBatch(baseOffset = 0, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(150, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(2, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 2
+   *  - Follower Fetch from last tiered offset: enabled
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset = 0
+   *  - Leader LocalLogStartOffset > LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledZeroLeaderSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    leaderState.logStartOffset = 0
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(150, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(2, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 3
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset = LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledNonZeroLeaderNoSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 10
+      mkBatch(baseOffset = 10, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(150, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(2, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 4
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset > LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledNonZeroLeaderSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    leaderState.logStartOffset = 10
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(150, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(2, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(150, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 4a
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset > LogStartOffset and LocalLogStartOffset == LogEndOffset
+   *  - All segments are uploaded and deleted locally
+   */
+  @ParameterizedTest
+  @ValueSource(longs = Array(0, 10))
+  def testFollowerFetchTieredOffsetTSEnabledAllLeaderSegmentsDeletedLocally(offsetToStartLog : Long): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 151L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 151
+    )
+    leaderState.logStartOffset = offsetToStartLog
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    // Replica log is truncated and fetch offset updated
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(151, replicaState.localLogStartOffset)
+    assertEquals(151, replicaState.logEndOffset)
+    assertEquals(151, replicaState.highWatermark)
+
+    // Call once again to see if new data is received
+    fetcher.doWork()
+    // No metadata update expected
+    assertEquals(0, replicaState.log.size)
+    assertEquals(151, replicaState.localLogStartOffset)
+    assertEquals(151, replicaState.logEndOffset)
+    assertEquals(151, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 5
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Disabled
+   *  - Leader LogStartOffset = 0
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSDisabledZeroLeader(): Unit = {
+    val rlmEnabled = false
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 0
+      mkBatch(baseOffset = 0, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(1, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(1, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 6
+   *  - Replica Start offset Strategy: TieredOffset
+   *  - TieredStorage Disabled
+   *  - Leader LogStartOffset != 0
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSDisabledNonZeroLeader(): Unit = {
+    val rlmEnabled = false
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 10
+      mkBatch(baseOffset = 10, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(10, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 13
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset = 0
+   *  - Leader LocalLogStartOffset = 0
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSEnabledZeroLeaderNoSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 0
+      mkBatch(baseOffset = 0, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(1, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(1, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 14
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset = 0
+   *  - Leader LocalLogStartOffset > LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSEnabledZeroLeaderSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    leaderState.logStartOffset = 0
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(100, replicaState.localLogStartOffset)
+    assertEquals(100, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(100, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 15
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset = LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSEnabledNonZeroLeaderNoSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 10
+      mkBatch(baseOffset = 10, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(10, replicaState.localLogStartOffset)
+    assertEquals(10, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(10, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 16
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset > LogStartOffset
+   *  - Some segments are uploaded
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSEnabledNonZeroLeaderSegmentsDeletedLocally(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 150
+    )
+    leaderState.logStartOffset = 10
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    // On offset-out-of-range error, fetch offset is updated
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(10, replicaState.localLogStartOffset)
+    assertEquals(10, replicaState.logEndOffset)
+
+    fetcher.doWork()
+    // On offset-moved-to-tiered-storage error, fetch offset is updated
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(100, replicaState.localLogStartOffset)
+    assertEquals(100, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(100, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 16a
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset > LogStartOffset and LocalLogStartOffset == LogEndOffset
+   *  - Some segments are uploaded
+   */
+  @ParameterizedTest
+  @ValueSource(longs = Array(0, 10))
+  def testFollowerFetchEarliestOffsetTSEnabledAllSegmentsDeletedLocally(offsetToStartLog : Long): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 151L,
+      rlmEnabled = rlmEnabled,
+      earliestOffsetPendingUpload = 151,
+    )
+    leaderState.localLogStartOffset = 151
+    leaderState.logStartOffset = offsetToStartLog
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    if (offsetToStartLog != 0) {
+      // On offset-out-of-range error, fetch offset is updated
+      // Assert offset update
+      assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+      assertEquals(0, replicaState.log.size)
+      assertEquals(offsetToStartLog, replicaState.localLogStartOffset)
+      assertEquals(offsetToStartLog, replicaState.logEndOffset)
+    }
+
+    // On offset-moved-to-tiered-storage error, fetch offset is updated
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(151, replicaState.localLogStartOffset)
+    assertEquals(151, replicaState.logEndOffset)
+    assertEquals(151, replicaState.highWatermark)
+
+
+    // Call once again to see if new data is received
+    fetcher.doWork()
+    // No metadata update expected
+    assertEquals(0, replicaState.log.size)
+    assertEquals(151, replicaState.localLogStartOffset)
+    assertEquals(151, replicaState.logEndOffset)
+    assertEquals(151, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 17
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Disabled
+   *  - Leader LogStartOffset = 0
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSDisabledZeroLeader(): Unit = {
+    val rlmEnabled = false
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 0
+      mkBatch(baseOffset = 0, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(1, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(1, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   * Case 18
+   *  - Replica Start offset Strategy: Earliest
+   *  - TieredStorage Disabled
+   *  - Leader LogStartOffset != 0
+   */
+  @Test
+  def testFollowerFetchEarliestOffsetTSDisabledNonZeroLeader(): Unit = {
+    val rlmEnabled = false
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = false)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 10
+      mkBatch(baseOffset = 10, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(10, replicaState.logEndOffset)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   *  - Replica Start offset Strategy : TieredOffset
+   *  - TieredStorage enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset = LogStartOffset
+   *  - No segments are uploaded
+   *
+   * The follower should in this case should start replicating all logs from the leader start offset
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledNonZeroLeaderNoSegmentsUploaded(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 10
+      mkBatch(baseOffset = 10, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      // Leader has not uploaded any log segments, hence the offset and epoch are both -1
+      // earliestOffsetPendingUpload = -1
+      earliestOffsetPendingUpload = 10
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(0, replicaState.log.size)
+    assertEquals(10, replicaState.localLogStartOffset)
+    assertEquals(10, replicaState.logEndOffset)
+    assertEquals(10, replicaState.highWatermark)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 3) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(10, replicaState.logStartOffset)
+    assertEquals(10, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   *  - Replica Start offset Strategy : TieredOffset
+   *  - TieredStorage enabled
+   *  - Leader LogStartOffset = 0
+   *  - Leader LocalLogStartOffset = LogStartOffset
+   *  - No segments are uploaded
+   *
+   * The follower should in this case should start replicating all logs from the leader start offset (0)
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledZeroLeaderNoSegmentsUploaded(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LogStartOffset = LocalLogStartOffset = 0
+      mkBatch(baseOffset = 0, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      // Leader has not uploaded any log segments, hence the offset and epoch are both -1
+      // earliestOffsetPendingUpload = -1,
+      earliestOffsetPendingUpload = 0
+    )
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+    fetcher.doWork()
+    assertEquals(Option(Fetching), fetcher.fetchState(partition).map(_.state))
+    assertEquals(1, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(1, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+
+    // Only 1 record batch is returned after a poll so calling 'n' number of times to get the desired result.
+    for (_ <- 1 to 2) fetcher.doWork()
+    assertEquals(3, replicaState.log.size)
+    assertEquals(0, replicaState.logStartOffset)
+    assertEquals(0, replicaState.localLogStartOffset)
+    assertEquals(200, replicaState.logEndOffset)
+    assertEquals(199, replicaState.highWatermark)
+  }
+
+  /**
+   *  - Replica Start offset Strategy : TieredOffset
+   *  - TieredStorage enabled
+   *  - Leader LogStartOffset != 0
+   *  - Leader LocalLogStartOffset > LogStartOffset
+   *  - Some segments are uploaded, but the current leader does not know about it yet (it is still initializing)
+   *
+   * The follower should in this case should throw a retryable exception and re-attempt after some delay
+   */
+  @Test
+  def testFollowerFetchTieredOffsetTSEnabledNonZeroLeaderSegmentsUploadedNewlyElectedLeader(): Unit = {
+    val rlmEnabled = true
+    val partition = new TopicPartition("topic1", 0)
+    val mockLeaderEndpoint = new MockLeaderEndPoint(truncateOnFetch = truncateOnFetch, version = version)
+    val mockTierStateMachine = new MockTierStateMachine(mockLeaderEndpoint)
+    val fetcher = new MockFetcherThread(mockLeaderEndpoint, mockTierStateMachine, enableFollowerFetchLastTieredOffset = true)
+
+    val replicaState = emptyReplicaState(rlmEnabled, partition, fetcher)
+
+    val leaderLog = Seq(
+      // LocalLogStartOffset = 100
+      mkBatch(baseOffset = 100, leaderEpoch = 0, new SimpleRecord("c".getBytes)),
+      mkBatch(baseOffset = 150, leaderEpoch = 0, new SimpleRecord("d".getBytes)),
+      mkBatch(baseOffset = 199, leaderEpoch = 0, new SimpleRecord("e".getBytes))
+    )
+
+    val leaderState = PartitionState(
+      leaderLog,
+      leaderEpoch = 0,
+      highWatermark = 199L,
+      rlmEnabled = rlmEnabled,
+      // Leader has not uploaded any log segments, hence the offset and epoch are both -1
+      earliestOffsetPendingUpload = -1,
+    )
+    leaderState.logStartOffset = 10
+    fetcher.mockLeader.setLeaderState(partition, leaderState)
+    fetcher.mockLeader.setReplicaPartitionStateCallback(fetcher.replicaPartitionState)
+
+
+    fetcher.doWork()
+    val fetchStateOpt = fetcher.fetchState(partition)
+    assertTrue(fetchStateOpt.nonEmpty)
+    assertEquals(Fetching, fetchStateOpt.get.state)
+    // Fetch offset remains unchanged
+    assertEquals(0, fetchStateOpt.get.fetchOffset)
+    // Lag remains unchanged
+    assertEquals(None, fetchStateOpt.get.lag)
+    assertEquals(0, fetchStateOpt.get.currentLeaderEpoch)
+    // Fetch will be retried after some delay
+    assertTrue(fetchStateOpt.get.delay.nonEmpty)
+    assertEquals(Some(0), fetchStateOpt.get.lastFetchedEpoch)
+
+    // LogEndOffset is unchanged
+    assertEquals(0, replicaState.logEndOffset)
+  }
 }

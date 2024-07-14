@@ -23,7 +23,7 @@ import kafka.log.remote.RemoteLogManager;
 
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.message.FetchResponseData.PartitionData;
+import org.apache.kafka.common.Uuid;
 import org.apache.kafka.common.message.OffsetForLeaderEpochRequestData;
 import org.apache.kafka.common.message.OffsetForLeaderEpochResponseData;
 import org.apache.kafka.common.protocol.Errors;
@@ -92,15 +92,12 @@ public class TierStateMachine {
      *         tier state machine
      */
     PartitionFetchState start(TopicPartition topicPartition,
-                              PartitionFetchState currentFetchState,
-                              PartitionData fetchPartitionData) throws Exception {
-        OffsetAndEpoch epochAndLeaderLocalStartOffset = leader.fetchEarliestLocalOffset(topicPartition, currentFetchState.currentLeaderEpoch());
-        int epoch = epochAndLeaderLocalStartOffset.leaderEpoch();
-        long leaderLocalStartOffset = epochAndLeaderLocalStartOffset.offset();
-
-        long offsetToFetch;
-        replicaMgr.brokerTopicStats().topicStats(topicPartition.topic()).buildRemoteLogAuxStateRequestRate().mark();
-        replicaMgr.brokerTopicStats().allTopicsStats().buildRemoteLogAuxStateRequestRate().mark();
+                              Option<Uuid> topicId,
+                              int currentLeaderEpoch,
+                              long leaderLocalStartOffset,
+                              OffsetAndEpoch offsetAndEpochToStartLocalLog) throws Exception {
+        long offsetToStartLocalLog = offsetAndEpochToStartLocalLog.offset();
+        int epoch = offsetAndEpochToStartLocalLog.leaderEpoch();
 
         UnifiedLog unifiedLog;
         if (useFutureLog) {
@@ -109,22 +106,32 @@ public class TierStateMachine {
             unifiedLog = replicaMgr.localLogOrException(topicPartition);
         }
 
-        try {
-            offsetToFetch = buildRemoteLogAuxState(topicPartition, currentFetchState.currentLeaderEpoch(), leaderLocalStartOffset, epoch, fetchPartitionData.logStartOffset(), unifiedLog);
-        } catch (RemoteStorageException e) {
-            replicaMgr.brokerTopicStats().topicStats(topicPartition.topic()).failedBuildRemoteLogAuxStateRate().mark();
-            replicaMgr.brokerTopicStats().allTopicsStats().failedBuildRemoteLogAuxStateRate().mark();
-            throw e;
+        long offsetToFetch;
+
+        if (offsetToStartLocalLog == leaderLocalStartOffset) {
+            Partition partition = replicaMgr.getPartitionOrException(topicPartition);
+            partition.truncateFullyAndStartAt(leaderLocalStartOffset, useFutureLog, Option.apply(leaderLocalStartOffset));
+            offsetToFetch = unifiedLog.logEndOffset();
+        } else {
+            replicaMgr.brokerTopicStats().topicStats(topicPartition.topic()).buildRemoteLogAuxStateRequestRate().mark();
+            replicaMgr.brokerTopicStats().allTopicsStats().buildRemoteLogAuxStateRequestRate().mark();
+            try {
+                offsetToFetch = buildRemoteLogAuxState(topicPartition, currentLeaderEpoch, offsetToStartLocalLog, epoch,
+                        leaderLocalStartOffset, unifiedLog);
+            } catch (RemoteStorageException e) {
+                replicaMgr.brokerTopicStats().topicStats(topicPartition.topic()).failedBuildRemoteLogAuxStateRate().mark();
+                replicaMgr.brokerTopicStats().allTopicsStats().failedBuildRemoteLogAuxStateRate().mark();
+                throw e;
+            }
         }
 
-        OffsetAndEpoch fetchLatestOffsetResult = leader.fetchLatestOffset(topicPartition, currentFetchState.currentLeaderEpoch());
+        OffsetAndEpoch fetchLatestOffsetResult = leader.fetchLatestOffset(topicPartition, currentLeaderEpoch);
         long leaderEndOffset = fetchLatestOffsetResult.offset();
 
         long initialLag = leaderEndOffset - offsetToFetch;
 
-        return PartitionFetchState.apply(currentFetchState.topicId(), offsetToFetch, Option.apply(initialLag), currentFetchState.currentLeaderEpoch(),
+        return PartitionFetchState.apply(topicId, offsetToFetch, Option.apply(initialLag), currentLeaderEpoch,
                 Fetching$.MODULE$, unifiedLog.latestEpoch());
-
     }
 
     private OffsetForLeaderEpochResponseData.EpochEndOffset fetchEarlierEpochEndOffset(Integer epoch,
@@ -181,8 +188,8 @@ public class TierStateMachine {
      */
     private Long buildRemoteLogAuxState(TopicPartition topicPartition,
                                         Integer currentLeaderEpoch,
-                                        Long leaderLocalLogStartOffset,
-                                        Integer epochForLeaderLocalLogStartOffset,
+                                        Long offsetToStartLocalLog,
+                                        Integer leaderEpochForOffsetToStartLocalLog,
                                         Long leaderLogStartOffset,
                                         UnifiedLog unifiedLog) throws IOException, RemoteStorageException {
 
@@ -199,15 +206,15 @@ public class TierStateMachine {
 
         // Find the respective leader epoch for (leaderLocalLogStartOffset - 1). We need to build the leader epoch cache
         // until that offset
-        long previousOffsetToLeaderLocalLogStartOffset = leaderLocalLogStartOffset - 1;
+        long previousOffsetToLeaderLocalLogStartOffset = offsetToStartLocalLog - 1;
         int targetEpoch;
         // If the existing epoch is 0, no need to fetch from earlier epoch as the desired offset(leaderLogStartOffset - 1)
         // will have the same epoch.
-        if (epochForLeaderLocalLogStartOffset == 0) {
-            targetEpoch = epochForLeaderLocalLogStartOffset;
+        if (leaderEpochForOffsetToStartLocalLog == 0) {
+            targetEpoch = leaderEpochForOffsetToStartLocalLog;
         } else {
             // Fetch the earlier epoch/end-offset(exclusive) from the leader.
-            OffsetForLeaderEpochResponseData.EpochEndOffset earlierEpochEndOffset = fetchEarlierEpochEndOffset(epochForLeaderLocalLogStartOffset, topicPartition, currentLeaderEpoch);
+            OffsetForLeaderEpochResponseData.EpochEndOffset earlierEpochEndOffset = fetchEarlierEpochEndOffset(leaderEpochForOffsetToStartLocalLog, topicPartition, currentLeaderEpoch);
             // Check if the target offset lies within the range of earlier epoch. Here, epoch's end-offset is exclusive.
             if (earlierEpochEndOffset.endOffset() > previousOffsetToLeaderLocalLogStartOffset) {
                 // Always use the leader epoch from returned earlierEpochEndOffset.
@@ -224,14 +231,14 @@ public class TierStateMachine {
                 // So, for offset 89, we should return leader epoch as 1 like below.
                 targetEpoch = earlierEpochEndOffset.leaderEpoch();
             } else {
-                targetEpoch = epochForLeaderLocalLogStartOffset;
+                targetEpoch = leaderEpochForOffsetToStartLocalLog;
             }
         }
 
         RemoteLogSegmentMetadata remoteLogSegmentMetadata = rlm.fetchRemoteLogSegmentMetadata(topicPartition, targetEpoch, previousOffsetToLeaderLocalLogStartOffset)
                 .orElseThrow(() -> new RemoteStorageException("Couldn't build the state from remote store for partition: " + topicPartition +
                         ", currentLeaderEpoch: " + currentLeaderEpoch +
-                        ", leaderLocalLogStartOffset: " + leaderLocalLogStartOffset +
+                        ", leaderLocalLogStartOffset: " + offsetToStartLocalLog +
                         ", leaderLogStartOffset: " + leaderLogStartOffset +
                         ", epoch: " + targetEpoch +
                         "as the previous remote log segment metadata was not found"));
@@ -255,7 +262,7 @@ public class TierStateMachine {
             unifiedLog.leaderEpochCache().get().assign(epochs);
         }
 
-        log.info("Updated the epoch cache from remote tier till offset: {} with size: {} for {}", leaderLocalLogStartOffset, epochs.size(), partition);
+        log.info("Updated the epoch cache from remote tier till offset: {} with size: {} for {}", offsetToStartLocalLog, epochs.size(), partition);
 
         buildProducerSnapshotFile(unifiedLog, nextOffset, remoteLogSegmentMetadata, rlm);
 

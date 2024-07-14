@@ -35,7 +35,8 @@ class MockFetcherThread(val mockLeader: MockLeaderEndPoint,
                         val replicaId: Int = 0,
                         val leaderId: Int = 1,
                         fetchBackOffMs: Int = 0,
-                        failedPartitions: FailedPartitions = new FailedPartitions)
+                        failedPartitions: FailedPartitions = new FailedPartitions,
+                        enableFollowerFetchLastTieredOffset: Boolean = false)
   extends AbstractFetcherThread("mock-fetcher",
     clientId = "mock-fetcher",
     leader = mockLeader,
@@ -164,4 +165,8 @@ class MockFetcherThread(val mockLeader: MockLeaderEndPoint,
   }
 
   override protected val isOffsetForLeaderEpochSupported: Boolean = true
+
+  override protected def shouldUseTieredOffsetStrategy(topicPartition: TopicPartition, leaderEndOffset: Long, replicaEndOffset: Long): Boolean = {
+    enableFollowerFetchLastTieredOffset && replicaPartitionState(topicPartition).rlmEnabled && replicaEndOffset == 0 && leaderEndOffset != 0
+  }
 }
